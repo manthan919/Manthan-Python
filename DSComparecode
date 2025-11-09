@@ -470,39 +470,77 @@ def collect_tdsx_files(directory):
 
 
 def main():
+    """Main function to orchestrate the comparison and report generation.
+
+    This version adds debug prints to help diagnose why matched/unmatched counts
+    could be zero. It also ensures the report generator receives the structure
+    it expects: {'total': total, 'entries': entries}.
+    """
     parser = argparse.ArgumentParser()
     parser.add_argument('--pre', required=True, help='Directory containing pre-deployment .tdsx files')
     parser.add_argument('--post', required=True, help='Directory containing post-deployment .tdsx files')
     parser.add_argument('--output', default='datasource_comparison_report.html', help='Output HTML report path')
     args = parser.parse_args()
 
-    # Collect files (as requested: pre_files = collect_tdsx_files(path), post_files = collect_tdsx_files(path))
+    # Collect files
     pre_files = collect_tdsx_files(args.pre)
     post_files = collect_tdsx_files(args.post)
 
+    print(f"DEBUG: pre_files found={len(pre_files)} files, post_files found={len(post_files)} files")
+    if len(pre_files) == 0 and len(post_files) == 0:
+        print("WARNING: No .tdsx files found in either directory. Check the paths and permissions.")
+
     all_keys = sorted(set(pre_files.keys()) | set(post_files.keys()))
     total = len(all_keys)
+    print(f"DEBUG: total distinct data source keys to compare = {total}")
+
     entries = []
 
     for key in all_keys:
         pre_path = pre_files.get(key)
         post_path = post_files.get(key)
+        print(f"DEBUG: Processing '{key}' -- pre: {bool(pre_path)} post: {bool(post_path)}")
 
         pre_root = None
         post_root = None
         if pre_path:
             pre_tds_str = extract_tds_from_tdsx(pre_path)
+            if pre_tds_str is None:
+                print(f"DEBUG: Failed to extract .tds from pre tdsx: {pre_path}")
             pre_root = parse_tds_from_string(pre_tds_str) if pre_tds_str else None
         if post_path:
             post_tds_str = extract_tds_from_tdsx(post_path)
+            if post_tds_str is None:
+                print(f"DEBUG: Failed to extract .tds from post tdsx: {post_path}")
             post_root = parse_tds_from_string(post_tds_str) if post_tds_str else None
 
         comps, is_matched = compare_two_datasources(pre_root, post_root)
+
+        # Extra debug: counts of matches/diffs per section
+        col = comps['columns']
+        md = comps['metadata']
+        xmlc = comps['xml']
+        col_match_count = len(col.get('matches') or [])
+        col_diff_count = len(col.get('diffs') or []) + len(col.get('only_pre') or []) + len(col.get('only_post') or [])
+        md_match_count = len(md.get('matches') or [])
+        md_diff_count = len(md.get('diffs') or []) + len(md.get('only_pre') or []) + len(md.get('only_post') or [])
+        xml_diff_count = sum(len(xmlc['diffs_by_path'].get(p, [])) for p in xmlc['diffs_by_path'])
+        xml_match_count = sum(len(xmlc['matches_by_path'].get(p, [])) for p in xmlc['matches_by_path'])
+
+        print(f"DEBUG: '{key}': cols matched={col_match_count}, cols diffs={col_diff_count}; md matched={md_match_count}, md diffs={md_diff_count}; xml matched={xml_match_count}, xml diffs={xml_diff_count}; is_matched={is_matched}")
+
         entries.append({'name': key, 'comparisons': comps, 'is_matched': is_matched})
 
     results = {'total': total, 'entries': entries}
+
+    # Sanity summary
+    matched_count = sum(1 for e in entries if e['is_matched'])
+    unmatched_count = sum(1 for e in entries if not e['is_matched'])
+    print(f"DEBUG: final counts -> total={total}, matched={matched_count}, unmatched={unmatched_count}")
+
     generate_html_report(results, args.output)
 
 
 if __name__ == '__main__':
     main()
+
