@@ -1,3 +1,9 @@
+# === CONFIGURATION PLACEHOLDERS ===
+PRE_DEPLOYMENT_FOLDER_PATH = '/path/to/pre_deployment'
+POST_DEPLOYMENT_FOLDER_PATH = '/path/to/post_deployment'
+REPORT_PATH = 'data_source_comparison_report.html'
+# ==================================
+
 import os
 import glob
 import zipfile
@@ -158,7 +164,11 @@ def generate_html_report(comparison_results, matched, unmatched, total):
     html.append("</body></html>")
     return '\n'.join(html)
 
-def compare_data_sources(pre_dir, post_dir, html_output='data_source_comparison_report.html'):
+def compare_data_sources(
+    pre_dir=PRE_DEPLOYMENT_FOLDER_PATH, 
+    post_dir=POST_DEPLOYMENT_FOLDER_PATH, 
+    html_output=REPORT_PATH
+): 
     pre_files = {os.path.splitext(os.path.basename(f))[0]: f for f in glob.glob(os.path.join(pre_dir, '*.tdsx'))}
     post_files = {os.path.splitext(os.path.basename(f))[0]: f for f in glob.glob(os.path.join(post_dir, '*.tdsx'))}
     all_keys = set(pre_files) | set(post_files)
@@ -221,6 +231,5 @@ def compare_data_sources(pre_dir, post_dir, html_output='data_source_comparison_
         f.write(html)
     print(f"Comparison report generated: {html_output}")
 
-# Usage Example:
-# compare_data_sources('PRE_DEPLOYMENT_FOLDER_PATH', 'POST_DEPLOYMENT_FOLDER_PATH')
-
+# --- RUN THE COMPARISON ---
+# compare_data_sources()
