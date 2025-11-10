@@ -1,0 +1,27 @@
+def build_details_tables_html(matches_by_path, diffs_by_path, pre_label="Pre Deployment", post_label="Post Deployment"):
+    def build_table(rows, headers=("Attribute", pre_label, post_label)):
+        h = '<table border="1" cellpadding="6" cellspacing="0">'
+        h += '<thead><tr>' + ''.join(f'<th style="background:#e6f2ff">{html.escape(col)}</th>' for col in headers) + '</tr></thead><tbody>'
+        if not rows:
+            h += f'<tr><td colspan="{len(headers)}"><em>No entries</em></td></tr>'
+        else:
+            for attr, pre, post in rows:
+                h += f'<tr><td>{html.escape(attr)}</td><td>{html.escape(pre or "Not Present")}</td><td>{html.escape(post or "Not Present")}</td></tr>'
+        h += '</tbody></table>'
+        return h
+
+    matches_rows = []
+    diffs_rows = []
+    for path in ALLOWED_DETAIL_PATHS:
+        matches = matches_by_path.get(path, [])
+        diffs = diffs_by_path.get(path, [])
+        for idx, val in matches:
+            attr = path if len(matches) <= 1 else f"{path}[{idx}]"
+            matches_rows.append((attr, val, val))
+        for idx, pre, post in diffs:
+            attr = path if len(diffs) <= 1 else f"{path}[{idx}]"
+            diffs_rows.append((attr, pre or "Not Present", post or "Not Present"))
+
+    matches_html = build_table(matches_rows)
+    diffs_html = build_table(diffs_rows)
+    return matches_html, diffs_html
