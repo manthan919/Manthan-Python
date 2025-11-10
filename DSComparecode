@@ -1,24 +1,11 @@
 #!/usr/bin/env python3
 """
-Tableau datasource comparator - complete script (final).
+Tableau datasource comparator - updated
 
-Features:
-- Scans two directories (PRE_DIR, POST_DIR) for .tdsx files and compares each datasource.
-- Compares:
-    1) Columns: keyed by <name> (prefix Parameter_ if param-domain-type present), caption -> Tableau field name,
-       hidden -> Yes/No (defaults to No). Skips columns whose name or caption equals "[Migrated Data]".
-    2) Metadata: keyed by <remote-name>, values local-name and local-type.
-    3) Details Comparison (named-connections & object-graph): reads caption, schema, username, relation table/text/name.
-- Produces an HTML report (datasource_comparison_report.html) with:
-    - Lists of matched and unmatched datasources
-    - Drill-downs (collapsed by default) for Column, Metadata, Details comparisons
-    - Radio controls to expand "Show All Matches" or "Show All Differences" or Clear selection
-- Uses the base folder names (derived from PRE_DIR and POST_DIR) as the Pre/Post group headers.
-- SKIP_DETAILS flag: when True, details comparison is ignored when deciding matched/unmatched.
-  When SKIP_DETAILS=True the HTML will show a small note that details comparison was skipped.
-- Auto-opens the HTML after generation.
-
-Edit PRE_DIR and POST_DIR at the top to match your environment.
+- Aggressively extracts details from named-connections and object-graph relation nodes (including nested relations).
+- Uniform header background color.
+- Radio buttons "Show All Matches" / "Show All Differences" now expand matching sections AND their datasource parent <details>.
+- SKIP_DETAILS flag still available at top (set True to ignore details when deciding matched/unmatched).
 """
 import os
 import zipfile
@@ -32,7 +19,6 @@ POST_DIR = r"C:\Users\mr05197\PycharmProjects\pythonProject\Full Volume Release\
 OUTPUT_HTML = os.path.abspath("datasource_comparison_report.html")
 
 # Toggle: if True, ignore Details comparison when deciding matched/unmatched.
-# Set to True to see matches when ignoring named-connections/object-graph details.
 SKIP_DETAILS = False
 # --------------------------------------------------------------
 
@@ -201,6 +187,7 @@ def get_allowed_detail_values_from_tds(tds_root):
         if caption_val:
             results["root/connection/named-connection/caption"].append(caption_val)
 
+        # get connection child and capture attributes
         conn_child = nc.find("connection")
         if conn_child is not None:
             schema = (conn_child.get("schema") or conn_child.findtext("schema") or "").strip()
@@ -210,8 +197,7 @@ def get_allowed_detail_values_from_tds(tds_root):
             if username:
                 results["root/connection/named-connection/connection/username"].append(username)
 
-    # 2) connection/relation (table, text)
-    # There can be multiple relation nodes under connection
+    # 2) connection/relation (table, text) - direct relations under connection
     for rel in tds_root.findall(".//connection/relation"):
         table_attr = (rel.get("table") or "").strip()
         text_child = (rel.findtext("text") or "").strip()
@@ -219,42 +205,48 @@ def get_allowed_detail_values_from_tds(tds_root):
             results["root/connection/relation/table"].append(table_attr)
         if text_child:
             results["root/connection/relation/text"].append(text_child)
-        # fallback: if no table but name exists, record name into table slot
         if not table_attr and rel.get("name"):
             results["root/connection/relation/table"].append(rel.get("name"))
 
     # 3) object-graph relation nodes (properties/relation)
-    # Search under object-graph for any relation nodes
-    for rel in tds_root.findall(".//object-graph//relation"):
-        table_attr = (rel.get("table") or "").strip()
-        name_attr = (rel.get("name") or "").strip()
-        table_child = (rel.findtext("table") or "").strip()
-        name_child = (rel.findtext("name") or "").strip()
-        if table_attr:
-            results["root/object-graph/objects/object/properties/relation/table"].append(table_attr)
-        elif table_child:
-            results["root/object-graph/objects/object/properties/relation/table"].append(table_child)
-        if name_attr:
-            results["root/object-graph/objects/object/properties/relation/name"].append(name_attr)
-        elif name_child:
-            results["root/object-graph/objects/object/properties/relation/name"].append(name_child)
+    # The object-graph can have relation elements nested inside joins/clauses; gather both parent relation and descendant relation elements.
+    # First try canonical path under object-graph
+    rel_roots = list(tds_root.findall(".//object-graph//objects//object//properties//relation"))
+    # Also gather any 'relation' nodes anywhere under object-graph as a fallback
+    rel_roots += [r for r in tds_root.findall(".//object-graph//relation") if r not in rel_roots]
+    # Also gather any relation nodes under properties (in case of alternative nesting)
+    rel_roots += [r for r in tds_root.findall(".//properties//relation") if r not in rel_roots]
 
-    # Also check generic properties/relation path (some tds use slightly different nesting)
-    for rel in tds_root.findall(".//properties//relation"):
-        table_attr = (rel.get("table") or "").strip()
-        name_attr = (rel.get("name") or "").strip()
-        table_child = (rel.findtext("table") or "").strip()
-        name_child = (rel.findtext("name") or "").strip()
-        if table_attr:
-            results["root/object-graph/objects/object/properties/relation/table"].append(table_attr)
-        elif table_child:
-            results["root/object-graph/objects/object/properties/relation/table"].append(table_child)
-        if name_attr:
-            results["root/object-graph/objects/object/properties/relation/name"].append(name_attr)
-        elif name_child:
-            results["root/object-graph/objects/object/properties/relation/name"].append(name_child)
+    # For each relation root, process it and any descendant relation elements
+    seen_rel_elements = set()
+    for rroot in rel_roots:
+        # process the root itself
+        for rel in [rroot] + list(rroot.findall(".//relation")):
+            # avoid processing same element twice (by id)
+            try:
+                ident = id(rel)
+            except Exception:
+                ident = None
+            if ident in seen_rel_elements:
+                continue
+            seen_rel_elements.add(ident)
+            table_attr = (rel.get("table") or "").strip()
+            name_attr = (rel.get("name") or "").strip()
+            table_child = (rel.findtext("table") or "").strip()
+            name_child = (rel.findtext("name") or "").strip()
+            if table_attr:
+                results["root/object-graph/objects/object/properties/relation/table"].append(table_attr)
+            elif table_child:
+                results["root/object-graph/objects/object/properties/relation/table"].append(table_child)
+            elif name_attr:
+                # some tds put useful value in name
+                results["root/object-graph/objects/object/properties/relation/table"].append(name_attr)
+            if name_attr:
+                results["root/object-graph/objects/object/properties/relation/name"].append(name_attr)
+            elif name_child:
+                results["root/object-graph/objects/object/properties/relation/name"].append(name_child)
 
-    # Deduplicate while preserving order
+    # Deduplicate while preserving order for each path
     for k, lst in results.items():
         seen = set()
         new = []
@@ -306,8 +298,8 @@ def build_column_tables_html(matches, diffs, only_pre, only_post, pre_label="Pre
     header = """
 <table class="compare" border="1" cellspacing="0" cellpadding="4">
 <thead>
-<tr><th rowspan="2">DB Field Name</th><th colspan="2">%s</th><th colspan="2">%s</th></tr>
-<tr><th>Tableau Field Name</th><th>Hidden</th><th>Tableau Field Name</th><th>Hidden</th></tr>
+<tr><th rowspan="2" style="background:#e6f2ff">DB Field Name</th><th colspan="2" style="background:#e6f2ff">%s</th><th colspan="2" style="background:#e6f2ff">%s</th></tr>
+<tr><th style="background:#e6f2ff">Tableau Field Name</th><th style="background:#e6f2ff">Hidden</th><th style="background:#e6f2ff">Tableau Field Name</th><th style="background:#e6f2ff">Hidden</th></tr>
 </thead>
 <tbody>
 """ % (pre_label, post_label)
@@ -348,8 +340,8 @@ def build_metadata_tables_html(matches, diffs, only_pre, only_post, pre_label="P
     header = """
 <table class="compare" border="1" cellspacing="0" cellpadding="4">
 <thead>
-<tr><th rowspan="2">DB Field Name</th><th colspan="2">%s</th><th colspan="2">%s</th></tr>
-<tr><th>Tableau Remote Field Name</th><th>Data type</th><th>Tableau Remote Field Name</th><th>Data type</th></tr>
+<tr><th rowspan="2" style="background:#e6f2ff">DB Field Name</th><th colspan="2" style="background:#e6f2ff">%s</th><th colspan="2" style="background:#e6f2ff">%s</th></tr>
+<tr><th style="background:#e6f2ff">Tableau Remote Field Name</th><th style="background:#e6f2ff">Data type</th><th style="background:#e6f2ff">Tableau Remote Field Name</th><th style="background:#e6f2ff">Data type</th></tr>
 </thead>
 <tbody>
 """ % (pre_label, post_label)
@@ -389,7 +381,7 @@ def build_metadata_tables_html(matches, diffs, only_pre, only_post, pre_label="P
 def build_details_tables_html(matches_by_path, diffs_by_path):
     def build_table(rows, headers=("Attribute", "Pre Deployment", "Post Deployment")):
         h = '<table border="1" cellpadding="6" cellspacing="0">'
-        h += '<thead><tr>' + ''.join(f'<th>{html.escape(col)}</th>' for col in headers) + '</tr></thead><tbody>'
+        h += '<thead><tr>' + ''.join(f'<th style="background:#e6f2ff">{html.escape(col)}</th>' for col in headers) + '</tr></thead><tbody>'
         if not rows:
             h += f'<tr><td colspan="{len(headers)}"><em>No entries</em></td></tr>'
         else:
@@ -428,21 +420,33 @@ def generate_html_report(results, output_path, pre_label, post_label):
 <style>
 body{font-family:Arial,Helvetica,sans-serif;padding:20px}
 table.compare{border-collapse:collapse;width:100%;margin-bottom:10px}
-table.compare th{background:#eee}
 details{margin-bottom:6px;padding:4px}
 table{width:100%;border-collapse:collapse}
-th{background:#e6f2ff}
 td, th{border:1px solid #999;padding:6px}
 .controls {margin-bottom:12px;padding:8px;background:#f5f5f5;border:1px solid #ddd;}
 .controls label{margin-right:12px;}
 .note {font-style:italic;color:#555;padding:6px;background:#f9f9f9;border-left:3px solid #ddd;margin-bottom:8px;}
+/* unified header color */
+th { background: #e6f2ff; }
 </style>
 <script>
+// Toggle helpers:
+// match-details = class for Matches details; diff-details = class for Differences details
+// ds-details = outer datasource details (will be opened so user is taken to table)
 function setAllMatches(open) {
-    document.querySelectorAll('details.match-details').forEach(d => d.open = !!open);
+    document.querySelectorAll('details.match-details').forEach(d => {
+        d.open = !!open;
+        // open parent datasource wrapper so user lands on the tables
+        const p = d.closest('details.ds-details');
+        if (p) p.open = !!open;
+    });
 }
 function setAllDiffs(open) {
-    document.querySelectorAll('details.diff-details').forEach(d => d.open = !!open);
+    document.querySelectorAll('details.diff-details').forEach(d => {
+        d.open = !!open;
+        const p = d.closest('details.ds-details');
+        if (p) p.open = !!open;
+    });
 }
 function onRadioChange() {
     var v = document.querySelector('input[name="viewtoggle"]:checked');
@@ -462,8 +466,8 @@ function onRadioChange() {
 function clearSelection() {
     var radios = document.querySelectorAll('input[name="viewtoggle"]');
     radios.forEach(r => r.checked = false);
-    setAllMatches(false);
-    setAllDiffs(false);
+    // collapse everything
+    document.querySelectorAll('details.match-details, details.diff-details, details.ds-details').forEach(d => d.open = false);
 }
 </script>
 ''')
@@ -486,7 +490,8 @@ function clearSelection() {
         for entry in unmatched:
             name = entry["name"]
             comps = entry["comparisons"]
-            html_parts.append(f'<li><details><summary>{html.escape(name)}</summary>')
+            # add class ds-details to the outer details so JS can open it when user selects radio
+            html_parts.append(f'<li><details class="ds-details"><summary>{html.escape(name)}</summary>')
             # Column Comparison
             col = comps["columns"]
             col_matches_html, col_diffs_html = build_column_tables_html(col["matches"], col["diffs"], col["only_pre"], col["only_post"], pre_label, post_label)
@@ -533,7 +538,7 @@ function clearSelection() {
         for entry in matched:
             name = entry["name"]
             comps = entry["comparisons"]
-            html_parts.append(f'<li><details><summary>{html.escape(name)}</summary>')
+            html_parts.append(f'<li><details class="ds-details"><summary>{html.escape(name)}</summary>')
             # Columns - only matches
             col = comps["columns"]
             col_matches_html, _ = build_column_tables_html(col["matches"], col["diffs"], col["only_pre"], col["only_post"], pre_label, post_label)
@@ -548,7 +553,7 @@ function clearSelection() {
             html_parts.append('<details class="match-details"><summary>Matches</summary>')
             html_parts.append(md_matches_html)
             html_parts.append('</details>')
-            # Details - only matches (or show skipped note)
+            # Details - only matches
             if not SKIP_DETAILS:
                 xmlc = comps["xml"]
                 details_matches_html, _ = build_details_tables_html(xmlc["matches_by_path"], xmlc["diffs_by_path"])
