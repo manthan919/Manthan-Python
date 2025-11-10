@@ -1,14 +1,24 @@
 #!/usr/bin/env python3
 """
-Tableau datasource comparator - final version with robust Details Comparison.
+Tableau datasource comparator - complete script (final).
 
-Edit PRE_DIR / POST_DIR at top to point to your folders. The script will:
- - scan each folder for .tdsx files
- - extract contained .tds XML
- - compare Columns, Metadata, and Details (named-connections & object-graph)
- - produce datasource_comparison_report.html and open it
+Features:
+- Scans two directories (PRE_DIR, POST_DIR) for .tdsx files and compares each datasource.
+- Compares:
+    1) Columns: keyed by <name> (prefix Parameter_ if param-domain-type present), caption -> Tableau field name,
+       hidden -> Yes/No (defaults to No). Skips columns whose name or caption equals "[Migrated Data]".
+    2) Metadata: keyed by <remote-name>, values local-name and local-type.
+    3) Details Comparison (named-connections & object-graph): reads caption, schema, username, relation table/text/name.
+- Produces an HTML report (datasource_comparison_report.html) with:
+    - Lists of matched and unmatched datasources
+    - Drill-downs (collapsed by default) for Column, Metadata, Details comparisons
+    - Radio controls to expand "Show All Matches" or "Show All Differences" or Clear selection
+- Uses the base folder names (derived from PRE_DIR and POST_DIR) as the Pre/Post group headers.
+- SKIP_DETAILS flag: when True, details comparison is ignored when deciding matched/unmatched.
+  When SKIP_DETAILS=True the HTML will show a small note that details comparison was skipped.
+- Auto-opens the HTML after generation.
 
-All <details> are collapsed by default. Radio controls available to expand Matches or Differences.
+Edit PRE_DIR and POST_DIR at the top to match your environment.
 """
 import os
 import zipfile
@@ -16,11 +26,15 @@ import xml.etree.ElementTree as ET
 import html
 import webbrowser
 
-# ---------------- CONFIGURE THESE PATHS ----------------
+# --------------------------- CONFIG ---------------------------
 PRE_DIR = r"C:\Users\mr05197\PycharmProjects\pythonProject\Full Volume Release\Downloaded Content\ISTD - 31"
 POST_DIR = r"C:\Users\mr05197\PycharmProjects\pythonProject\Full Volume Release\Downloaded Content\STD - FR"
 OUTPUT_HTML = os.path.abspath("datasource_comparison_report.html")
-# ------------------------------------------------------
+
+# Toggle: if True, ignore Details comparison when deciding matched/unmatched.
+# Set to True to see matches when ignoring named-connections/object-graph details.
+SKIP_DETAILS = False
+# --------------------------------------------------------------
 
 ALLOWED_DETAIL_PATHS = [
     "root/connection/relation/table",
@@ -33,7 +47,7 @@ ALLOWED_DETAIL_PATHS = [
 ]
 
 
-# ---------------- XML helpers ----------------
+# --------------------------- XML Utilities ---------------------------
 def strip_namespace(elem):
     if elem is None:
         return
@@ -80,7 +94,7 @@ def parse_tds_from_string(tds_string):
             return None
 
 
-# ---------------- Column extraction (skip Migrated Data) ----------------
+# --------------------------- Columns ---------------------------
 def resolve_column_key(col_elem, idx):
     name = (col_elem.findtext("name") or "").strip()
     if not name:
@@ -131,12 +145,12 @@ def get_columns(tds_root):
     return columns
 
 
-# ---------------- Metadata extraction ----------------
+# --------------------------- Metadata ---------------------------
 def get_metadata_records(tds_root):
     results = {}
     if tds_root is None:
         return results
-    # metadata-record direct nodes
+    # direct metadata-record nodes
     for rec in tds_root.findall(".//metadata-record"):
         remote = (rec.findtext("remote-name") or "").strip()
         local = (rec.findtext("local-name") or "").strip()
@@ -149,7 +163,7 @@ def get_metadata_records(tds_root):
             ltype = (rec.get("local-type") or rec.get("local_type") or "").strip()
         if remote:
             results[remote] = {"local_name": local, "local_type": ltype}
-    # fallback metadata-records/record
+    # fallback metadata-records/record nodes
     for rec in tds_root.findall(".//metadata-records//record"):
         remote = (rec.findtext("remote-name") or "").strip()
         local = (rec.findtext("local-name") or "").strip()
@@ -165,7 +179,7 @@ def get_metadata_records(tds_root):
     return results
 
 
-# ---------------- Details extraction (named-connections & object-graph) ----------------
+# --------------------------- Details (named-connections & object-graph) ---------------------------
 def get_allowed_detail_values_from_tds(tds_root):
     """
     Read specifically from:
@@ -179,16 +193,14 @@ def get_allowed_detail_values_from_tds(tds_root):
     if tds_root is None:
         return results
 
-    # 1) named-connection caption
+    # 1) named-connection caption & inner connection attributes
     for nc in tds_root.findall(".//named-connection"):
-        # caption attribute or child
-        caption_attr = nc.get("caption") or ""
+        caption_attr = (nc.get("caption") or "").strip()
         caption_child = (nc.findtext("caption") or "").strip()
         caption_val = caption_child or caption_attr
         if caption_val:
             results["root/connection/named-connection/caption"].append(caption_val)
 
-        # connection child (schema, username)
         conn_child = nc.find("connection")
         if conn_child is not None:
             schema = (conn_child.get("schema") or conn_child.findtext("schema") or "").strip()
@@ -197,28 +209,25 @@ def get_allowed_detail_values_from_tds(tds_root):
                 results["root/connection/named-connection/connection/schema"].append(schema)
             if username:
                 results["root/connection/named-connection/connection/username"].append(username)
-            # also if connection has other attributes that look like connection name, store fallback
-            # (not required but safe)
+
     # 2) connection/relation (table, text)
+    # There can be multiple relation nodes under connection
     for rel in tds_root.findall(".//connection/relation"):
         table_attr = (rel.get("table") or "").strip()
-        # some relations have <text> child or text node
         text_child = (rel.findtext("text") or "").strip()
         if table_attr:
             results["root/connection/relation/table"].append(table_attr)
         if text_child:
             results["root/connection/relation/text"].append(text_child)
-        # also if relation has name attribute and table is empty, keep name in table slot as fallback
+        # fallback: if no table but name exists, record name into table slot
         if not table_attr and rel.get("name"):
             results["root/connection/relation/table"].append(rel.get("name"))
 
     # 3) object-graph relation nodes (properties/relation)
-    # Try to find relation nodes under object-graph in a couple of likely paths
-    # Use findall for any 'relation' under object-graph
+    # Search under object-graph for any relation nodes
     for rel in tds_root.findall(".//object-graph//relation"):
         table_attr = (rel.get("table") or "").strip()
         name_attr = (rel.get("name") or "").strip()
-        # check child elements text
         table_child = (rel.findtext("table") or "").strip()
         name_child = (rel.findtext("name") or "").strip()
         if table_attr:
@@ -230,7 +239,7 @@ def get_allowed_detail_values_from_tds(tds_root):
         elif name_child:
             results["root/object-graph/objects/object/properties/relation/name"].append(name_child)
 
-    # Some TDS may place relation elements at a slightly different nesting; also check for properties/relation
+    # Also check generic properties/relation path (some tds use slightly different nesting)
     for rel in tds_root.findall(".//properties//relation"):
         table_attr = (rel.get("table") or "").strip()
         name_attr = (rel.get("name") or "").strip()
@@ -245,7 +254,7 @@ def get_allowed_detail_values_from_tds(tds_root):
         elif name_child:
             results["root/object-graph/objects/object/properties/relation/name"].append(name_child)
 
-    # Deduplicate while preserving order for each path
+    # Deduplicate while preserving order
     for k, lst in results.items():
         seen = set()
         new = []
@@ -263,7 +272,7 @@ def get_allowed_detail_values_from_tds(tds_root):
     return results
 
 
-# ---------------- Comparison helpers ----------------
+# --------------------------- Compare Helpers ---------------------------
 def compare_keyed_dicts(pre_dict, post_dict):
     matches, diffs, only_pre, only_post = [], [], [], []
     pre_keys, post_keys = set(pre_dict.keys()), set(post_dict.keys())
@@ -292,7 +301,7 @@ def compare_lists_by_index(pre_list, post_list):
     return matches, diffs
 
 
-# ---------------- HTML builders ----------------
+# --------------------------- HTML Builders ---------------------------
 def build_column_tables_html(matches, diffs, only_pre, only_post, pre_label="Pre-Deployment", post_label="Post Deployment"):
     header = """
 <table class="compare" border="1" cellspacing="0" cellpadding="4">
@@ -406,7 +415,7 @@ def build_details_tables_html(matches_by_path, diffs_by_path):
     return matches_html, diffs_html
 
 
-# ---------------- Report generation (controls + collapsed by default) ----------------
+# --------------------------- Report Generation ---------------------------
 def generate_html_report(results, output_path, pre_label, post_label):
     total = results.get("total", 0)
     entries = results.get("entries", [])
@@ -426,6 +435,7 @@ th{background:#e6f2ff}
 td, th{border:1px solid #999;padding:6px}
 .controls {margin-bottom:12px;padding:8px;background:#f5f5f5;border:1px solid #ddd;}
 .controls label{margin-right:12px;}
+.note {font-style:italic;color:#555;padding:6px;background:#f9f9f9;border-left:3px solid #ddd;margin-bottom:8px;}
 </style>
 <script>
 function setAllMatches(open) {
@@ -487,7 +497,7 @@ function clearSelection() {
             html_parts.append('<details class="diff-details"><summary>Differences</summary>')
             html_parts.append(col_diffs_html)
             html_parts.append('</details>')
-            # Metadata Comparison
+            # Metadata
             md = comps["metadata"]
             md_matches_html, md_diffs_html = build_metadata_tables_html(md["matches"], md["diffs"], md["only_pre"], md["only_post"], pre_label, post_label)
             html_parts.append('<h4>Metadata Comparison</h4>')
@@ -497,16 +507,20 @@ function clearSelection() {
             html_parts.append('<details class="diff-details"><summary>Differences</summary>')
             html_parts.append(md_diffs_html)
             html_parts.append('</details>')
-            # Details Comparison
-            xmlc = comps["xml"]
-            details_matches_html, details_diffs_html = build_details_tables_html(xmlc["matches_by_path"], xmlc["diffs_by_path"])
-            html_parts.append('<h4>Details Comparison</h4>')
-            html_parts.append('<details class="match-details"><summary>Matches</summary>')
-            html_parts.append(details_matches_html)
-            html_parts.append('</details>')
-            html_parts.append('<details class="diff-details"><summary>Differences</summary>')
-            html_parts.append(details_diffs_html)
-            html_parts.append('</details>')
+            # Details
+            if not SKIP_DETAILS:
+                xmlc = comps["xml"]
+                details_matches_html, details_diffs_html = build_details_tables_html(xmlc["matches_by_path"], xmlc["diffs_by_path"])
+                html_parts.append('<h4>Details Comparison</h4>')
+                html_parts.append('<details class="match-details"><summary>Matches</summary>')
+                html_parts.append(details_matches_html)
+                html_parts.append('</details>')
+                html_parts.append('<details class="diff-details"><summary>Differences</summary>')
+                html_parts.append(details_diffs_html)
+                html_parts.append('</details>')
+            else:
+                html_parts.append('<h4>Details Comparison</h4>')
+                html_parts.append('<p class="note"><em>Details comparison skipped (SKIP_DETAILS=True)</em></p>')
             html_parts.append('</details></li>')
         html_parts.append('</ol>')
     else:
@@ -534,13 +548,17 @@ function clearSelection() {
             html_parts.append('<details class="match-details"><summary>Matches</summary>')
             html_parts.append(md_matches_html)
             html_parts.append('</details>')
-            # Details - only matches
-            xmlc = comps["xml"]
-            details_matches_html, _ = build_details_tables_html(xmlc["matches_by_path"], xmlc["diffs_by_path"])
-            html_parts.append('<h4>Details Comparison</h4>')
-            html_parts.append('<details class="match-details"><summary>Matches</summary>')
-            html_parts.append(details_matches_html)
-            html_parts.append('</details>')
+            # Details - only matches (or show skipped note)
+            if not SKIP_DETAILS:
+                xmlc = comps["xml"]
+                details_matches_html, _ = build_details_tables_html(xmlc["matches_by_path"], xmlc["diffs_by_path"])
+                html_parts.append('<h4>Details Comparison</h4>')
+                html_parts.append('<details class="match-details"><summary>Matches</summary>')
+                html_parts.append(details_matches_html)
+                html_parts.append('</details>')
+            else:
+                html_parts.append('<h4>Details Comparison</h4>')
+                html_parts.append('<p class="note"><em>Details comparison skipped (SKIP_DETAILS=True)</em></p>')
             html_parts.append('</details></li>')
         html_parts.append('</ol>')
     else:
@@ -553,7 +571,7 @@ function clearSelection() {
     print(f"INFO: Wrote report: {output_path}")
 
 
-# ---------------- Core comparison flow ----------------
+# --------------------------- Core Comparison ---------------------------
 def compare_two_datasources(pre_tds_root, post_tds_root):
     pre_cols = get_columns(pre_tds_root)
     post_cols = get_columns(post_tds_root)
@@ -563,16 +581,19 @@ def compare_two_datasources(pre_tds_root, post_tds_root):
     post_md = get_metadata_records(post_tds_root)
     md_matches, md_diffs, md_only_pre, md_only_post = compare_keyed_dicts(pre_md, post_md)
 
-    # DETAILS: read directly from the tds_root (named-connections & object-graph)
-    pre_details = get_allowed_detail_values_from_tds(pre_tds_root)
-    post_details = get_allowed_detail_values_from_tds(post_tds_root)
-
-    matches_by_path, diffs_by_path = {}, {}
-    for path in ALLOWED_DETAIL_PATHS:
-        pre_list = pre_details.get(path, [])
-        post_list = post_details.get(path, [])
-        m, d = compare_lists_by_index(pre_list, post_list)
-        matches_by_path[path], diffs_by_path[path] = m, d
+    # DETAILS: compute conditionally based on SKIP_DETAILS
+    if SKIP_DETAILS:
+        matches_by_path = {p: [] for p in ALLOWED_DETAIL_PATHS}
+        diffs_by_path = {p: [] for p in ALLOWED_DETAIL_PATHS}
+    else:
+        pre_details = get_allowed_detail_values_from_tds(pre_tds_root)
+        post_details = get_allowed_detail_values_from_tds(post_tds_root)
+        matches_by_path, diffs_by_path = {}, {}
+        for path in ALLOWED_DETAIL_PATHS:
+            pre_list = pre_details.get(path, [])
+            post_list = post_details.get(path, [])
+            m, d = compare_lists_by_index(pre_list, post_list)
+            matches_by_path[path], diffs_by_path[path] = m, d
 
     comparison_summary = {
         "columns": {"matches": col_matches, "diffs": col_diffs, "only_pre": col_only_pre, "only_post": col_only_post},
@@ -582,13 +603,16 @@ def compare_two_datasources(pre_tds_root, post_tds_root):
 
     has_col_diff = bool(col_diffs or col_only_pre or col_only_post)
     has_md_diff = bool(md_diffs or md_only_pre or md_only_post)
-    has_xml_diff = any(diffs_by_path[path] for path in ALLOWED_DETAIL_PATHS)
+    if SKIP_DETAILS:
+        has_xml_diff = False
+    else:
+        has_xml_diff = any(diffs_by_path[path] for path in ALLOWED_DETAIL_PATHS)
     is_matched = not (has_col_diff or has_md_diff or has_xml_diff)
 
     return comparison_summary, is_matched
 
 
-# ---------------- File collection ----------------
+# --------------------------- File collection ---------------------------
 def collect_tdsx_files(directory):
     files = {}
     if not directory or not os.path.isdir(directory):
@@ -600,7 +624,7 @@ def collect_tdsx_files(directory):
     return files
 
 
-# ---------------- Main ----------------
+# --------------------------- Main ---------------------------
 def main():
     pre_files = collect_tdsx_files(PRE_DIR)
     post_files = collect_tdsx_files(POST_DIR)
