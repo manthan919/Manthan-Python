@@ -1,16 +1,14 @@
 #!/usr/bin/env python3
 """
-Tableau datasource comparator with UI controls to expand/collapse matches/differences.
+Tableau datasource comparator - final version with robust Details Comparison.
 
-Key UI changes:
- - All <details> are collapsed by default.
- - Two radio buttons at top: "Show All Matches" and "Show All Differences".
- - A 'Clear selection' button collapses all details again.
+Edit PRE_DIR / POST_DIR at top to point to your folders. The script will:
+ - scan each folder for .tdsx files
+ - extract contained .tds XML
+ - compare Columns, Metadata, and Details (named-connections & object-graph)
+ - produce datasource_comparison_report.html and open it
 
-Other behavior:
- - Skips columns marked as '[Migrated Data]'.
- - Column and metadata comparisons as before.
- - Details Comparison reads named-connections and object-graph areas robustly.
+All <details> are collapsed by default. Radio controls available to expand Matches or Differences.
 """
 import os
 import zipfile
@@ -18,11 +16,11 @@ import xml.etree.ElementTree as ET
 import html
 import webbrowser
 
-# ---------------- Configuration ----------------
+# ---------------- CONFIGURE THESE PATHS ----------------
 PRE_DIR = r"C:\Users\mr05197\PycharmProjects\pythonProject\Full Volume Release\Downloaded Content\ISTD - 31"
 POST_DIR = r"C:\Users\mr05197\PycharmProjects\pythonProject\Full Volume Release\Downloaded Content\STD - FR"
 OUTPUT_HTML = os.path.abspath("datasource_comparison_report.html")
-# ------------------------------------------------
+# ------------------------------------------------------
 
 ALLOWED_DETAIL_PATHS = [
     "root/connection/relation/table",
@@ -35,7 +33,7 @@ ALLOWED_DETAIL_PATHS = [
 ]
 
 
-# ---------------- XML utilities ----------------
+# ---------------- XML helpers ----------------
 def strip_namespace(elem):
     if elem is None:
         return
@@ -82,7 +80,7 @@ def parse_tds_from_string(tds_string):
             return None
 
 
-# ---------------- Column extraction & skipping Migrated Data ----------------
+# ---------------- Column extraction (skip Migrated Data) ----------------
 def resolve_column_key(col_elem, idx):
     name = (col_elem.findtext("name") or "").strip()
     if not name:
@@ -95,7 +93,6 @@ def resolve_column_key(col_elem, idx):
         name = (col_elem.get("caption") or "").strip()
     if not name:
         name = f"__unnamed_column__{idx}"
-    # param detection
     is_param = (col_elem.find("param-domain-type") is not None) or bool(col_elem.get("param-domain-type"))
     if is_param and not name.startswith("Parameter_"):
         name = "Parameter_" + name
@@ -139,6 +136,7 @@ def get_metadata_records(tds_root):
     results = {}
     if tds_root is None:
         return results
+    # metadata-record direct nodes
     for rec in tds_root.findall(".//metadata-record"):
         remote = (rec.findtext("remote-name") or "").strip()
         local = (rec.findtext("local-name") or "").strip()
@@ -151,6 +149,7 @@ def get_metadata_records(tds_root):
             ltype = (rec.get("local-type") or rec.get("local_type") or "").strip()
         if remote:
             results[remote] = {"local_name": local, "local_type": ltype}
+    # fallback metadata-records/record
     for rec in tds_root.findall(".//metadata-records//record"):
         remote = (rec.findtext("remote-name") or "").strip()
         local = (rec.findtext("local-name") or "").strip()
@@ -166,70 +165,101 @@ def get_metadata_records(tds_root):
     return results
 
 
-# ---------------- Inner XML / Details extraction ----------------
-def parse_inner_xml_from_tds(tds_root):
-    if tds_root is None:
-        return None
-    xml_elem = tds_root.find(".//xml")
-    content = None
-    if xml_elem is not None and xml_elem.text and xml_elem.text.strip():
-        content = xml_elem.text.strip()
-    if not content:
-        conn = tds_root.find(".//connection")
-        if conn is not None:
-            parts = []
-            for child in list(conn):
-                try:
-                    parts.append(ET.tostring(child, encoding="utf-8").decode("utf-8", errors="replace"))
-                except Exception:
-                    pass
-            if parts:
-                content = "<root>" + "".join(parts) + "</root>"
-    if not content:
-        return None
-    try:
-        inner_root = ET.fromstring(content)
-        strip_namespace(inner_root)
-        return inner_root
-    except Exception:
-        try:
-            inner_root = ET.fromstring(f"<root>{content}</root>")
-            strip_namespace(inner_root)
-            return inner_root
-        except Exception as e:
-            print(f"ERROR: Failed to parse inner xml: {e}")
-            return None
-
-
-def elem_best_value(elem):
-    if elem is None:
-        return ""
-    text = (elem.text or "").strip()
-    if text:
-        return text
-    for attr in ("table", "name", "caption", "schema", "username", "connection"):
-        v = elem.get(attr)
-        if v:
-            return v.strip()
-    if elem.attrib:
-        parts = [f"{k}={v}" for k, v in elem.attrib.items()]
-        return ";".join(parts)
-    return ""
-
-
-def get_allowed_detail_values(inner_root):
+# ---------------- Details extraction (named-connections & object-graph) ----------------
+def get_allowed_detail_values_from_tds(tds_root):
+    """
+    Read specifically from:
+      - named-connection nodes under connection -> capture caption
+      - named-connection/connection -> capture schema & username attributes
+      - connection/relation nodes -> capture table attribute and <text> child if present
+      - object-graph/.../relation nodes -> capture table and name attributes/text
+    Return dict: path -> [values...]
+    """
     results = {p: [] for p in ALLOWED_DETAIL_PATHS}
-    if inner_root is None:
+    if tds_root is None:
         return results
-    for path in ALLOWED_DETAIL_PATHS:
-        final_tag = path.split("/")[-1]
-        try:
-            found = inner_root.findall(".//" + final_tag)
-        except Exception:
-            found = []
-        for elem in found:
-            val = elem_best_value(elem)
-            results[path].append(val)
+
+    # 1) named-connection caption
+    for nc in tds_root.findall(".//named-connection"):
+        # caption attribute or child
+        caption_attr = nc.get("caption") or ""
+        caption_child = (nc.findtext("caption") or "").strip()
+        caption_val = caption_child or caption_attr
+        if caption_val:
+            results["root/connection/named-connection/caption"].append(caption_val)
+
+        # connection child (schema, username)
+        conn_child = nc.find("connection")
+        if conn_child is not None:
+            schema = (conn_child.get("schema") or conn_child.findtext("schema") or "").strip()
+            username = (conn_child.get("username") or conn_child.findtext("username") or "").strip()
+            if schema:
+                results["root/connection/named-connection/connection/schema"].append(schema)
+            if username:
+                results["root/connection/named-connection/connection/username"].append(username)
+            # also if connection has other attributes that look like connection name, store fallback
+            # (not required but safe)
+    # 2) connection/relation (table, text)
+    for rel in tds_root.findall(".//connection/relation"):
+        table_attr = (rel.get("table") or "").strip()
+        # some relations have <text> child or text node
+        text_child = (rel.findtext("text") or "").strip()
+        if table_attr:
+            results["root/connection/relation/table"].append(table_attr)
+        if text_child:
+            results["root/connection/relation/text"].append(text_child)
+        # also if relation has name attribute and table is empty, keep name in table slot as fallback
+        if not table_attr and rel.get("name"):
+            results["root/connection/relation/table"].append(rel.get("name"))
+
+    # 3) object-graph relation nodes (properties/relation)
+    # Try to find relation nodes under object-graph in a couple of likely paths
+    # Use findall for any 'relation' under object-graph
+    for rel in tds_root.findall(".//object-graph//relation"):
+        table_attr = (rel.get("table") or "").strip()
+        name_attr = (rel.get("name") or "").strip()
+        # check child elements text
+        table_child = (rel.findtext("table") or "").strip()
+        name_child = (rel.findtext("name") or "").strip()
+        if table_attr:
+            results["root/object-graph/objects/object/properties/relation/table"].append(table_attr)
+        elif table_child:
+            results["root/object-graph/objects/object/properties/relation/table"].append(table_child)
+        if name_attr:
+            results["root/object-graph/objects/object/properties/relation/name"].append(name_attr)
+        elif name_child:
+            results["root/object-graph/objects/object/properties/relation/name"].append(name_child)
+
+    # Some TDS may place relation elements at a slightly different nesting; also check for properties/relation
+    for rel in tds_root.findall(".//properties//relation"):
+        table_attr = (rel.get("table") or "").strip()
+        name_attr = (rel.get("name") or "").strip()
+        table_child = (rel.findtext("table") or "").strip()
+        name_child = (rel.findtext("name") or "").strip()
+        if table_attr:
+            results["root/object-graph/objects/object/properties/relation/table"].append(table_attr)
+        elif table_child:
+            results["root/object-graph/objects/object/properties/relation/table"].append(table_child)
+        if name_attr:
+            results["root/object-graph/objects/object/properties/relation/name"].append(name_attr)
+        elif name_child:
+            results["root/object-graph/objects/object/properties/relation/name"].append(name_child)
+
+    # Deduplicate while preserving order for each path
+    for k, lst in results.items():
+        seen = set()
+        new = []
+        for v in lst:
+            if v is None:
+                continue
+            vv = str(v).strip()
+            if not vv:
+                continue
+            if vv not in seen:
+                seen.add(vv)
+                new.append(vv)
+        results[k] = new
+
     return results
 
 
@@ -376,7 +406,7 @@ def build_details_tables_html(matches_by_path, diffs_by_path):
     return matches_html, diffs_html
 
 
-# ---------------- Report generation with JS controls ----------------
+# ---------------- Report generation (controls + collapsed by default) ----------------
 def generate_html_report(results, output_path, pre_label, post_label):
     total = results.get("total", 0)
     entries = results.get("entries", [])
@@ -385,7 +415,6 @@ def generate_html_report(results, output_path, pre_label, post_label):
 
     html_parts = []
     html_parts.append('<!doctype html><html><head><meta charset="utf-8"><title>Data source comparison report</title>')
-    # CSS + small JS to toggle details
     html_parts.append('''
 <style>
 body{font-family:Arial,Helvetica,sans-serif;padding:20px}
@@ -399,7 +428,6 @@ td, th{border:1px solid #999;padding:6px}
 .controls label{margin-right:12px;}
 </style>
 <script>
-// Toggle helpers: match-details = class for Matches details; diff-details = class for Differences details
 function setAllMatches(open) {
     document.querySelectorAll('details.match-details').forEach(d => d.open = !!open);
 }
@@ -408,7 +436,7 @@ function setAllDiffs(open) {
 }
 function onRadioChange() {
     var v = document.querySelector('input[name="viewtoggle"]:checked');
-    if (!v) { // none selected
+    if (!v) {
         setAllMatches(false);
         setAllDiffs(false);
         return;
@@ -435,22 +463,21 @@ function clearSelection() {
     html_parts.append(f'Total number of matched Data sources: <strong>{len(matched)}</strong><br>')
     html_parts.append(f'Total number of unmatched Data sources: <strong>{len(unmatched)}</strong></p>')
 
-    # Controls (radio buttons)
+    # Controls
     html_parts.append('<div class="controls"><strong>View:</strong> ')
     html_parts.append(f'<label><input type="radio" name="viewtoggle" value="matches" onchange="onRadioChange()"> Show All Matches</label>')
     html_parts.append(f'<label><input type="radio" name="viewtoggle" value="differences" onchange="onRadioChange()"> Show All Differences</label>')
     html_parts.append(f'<button onclick="clearSelection()" style="margin-left:10px">Clear selection</button></div>')
 
-    # Unmatched
+    # Unmatched list
     html_parts.append('<h2>List of Unmatched Data sources</h2>')
     if unmatched:
         html_parts.append('<ol>')
         for entry in unmatched:
             name = entry["name"]
             comps = entry["comparisons"]
-            # parent details (collapsed by default)
             html_parts.append(f'<li><details><summary>{html.escape(name)}</summary>')
-            # Column Comparison: mark matches/diffs details with classes
+            # Column Comparison
             col = comps["columns"]
             col_matches_html, col_diffs_html = build_column_tables_html(col["matches"], col["diffs"], col["only_pre"], col["only_post"], pre_label, post_label)
             html_parts.append('<h4>Column Comparison</h4>')
@@ -460,7 +487,7 @@ function clearSelection() {
             html_parts.append('<details class="diff-details"><summary>Differences</summary>')
             html_parts.append(col_diffs_html)
             html_parts.append('</details>')
-            # Metadata
+            # Metadata Comparison
             md = comps["metadata"]
             md_matches_html, md_diffs_html = build_metadata_tables_html(md["matches"], md["diffs"], md["only_pre"], md["only_post"], pre_label, post_label)
             html_parts.append('<h4>Metadata Comparison</h4>')
@@ -470,7 +497,7 @@ function clearSelection() {
             html_parts.append('<details class="diff-details"><summary>Differences</summary>')
             html_parts.append(md_diffs_html)
             html_parts.append('</details>')
-            # Details
+            # Details Comparison
             xmlc = comps["xml"]
             details_matches_html, details_diffs_html = build_details_tables_html(xmlc["matches_by_path"], xmlc["diffs_by_path"])
             html_parts.append('<h4>Details Comparison</h4>')
@@ -485,7 +512,7 @@ function clearSelection() {
     else:
         html_parts.append('<p><em>No unmatched data sources.</em></p>')
 
-    # Matched (only show Matches; details collapsed by default)
+    # Matched list (only matches shown)
     html_parts.append('<h2>List of Matched Data sources</h2>')
     if matched:
         html_parts.append('<ol>')
@@ -500,14 +527,14 @@ function clearSelection() {
             html_parts.append('<details class="match-details"><summary>Matches</summary>')
             html_parts.append(col_matches_html)
             html_parts.append('</details>')
-            # Metadata
+            # Metadata - only matches
             md = comps["metadata"]
             md_matches_html, _ = build_metadata_tables_html(md["matches"], md["diffs"], md["only_pre"], md["only_post"], pre_label, post_label)
             html_parts.append('<h4>Metadata Comparison</h4>')
             html_parts.append('<details class="match-details"><summary>Matches</summary>')
             html_parts.append(md_matches_html)
             html_parts.append('</details>')
-            # Details
+            # Details - only matches
             xmlc = comps["xml"]
             details_matches_html, _ = build_details_tables_html(xmlc["matches_by_path"], xmlc["diffs_by_path"])
             html_parts.append('<h4>Details Comparison</h4>')
@@ -526,7 +553,7 @@ function clearSelection() {
     print(f"INFO: Wrote report: {output_path}")
 
 
-# ---------------- High-level compare flow ----------------
+# ---------------- Core comparison flow ----------------
 def compare_two_datasources(pre_tds_root, post_tds_root):
     pre_cols = get_columns(pre_tds_root)
     post_cols = get_columns(post_tds_root)
@@ -536,10 +563,9 @@ def compare_two_datasources(pre_tds_root, post_tds_root):
     post_md = get_metadata_records(post_tds_root)
     md_matches, md_diffs, md_only_pre, md_only_post = compare_keyed_dicts(pre_md, post_md)
 
-    pre_inner = parse_inner_xml_from_tds(pre_tds_root)
-    post_inner = parse_inner_xml_from_tds(post_tds_root)
-    pre_details = get_allowed_detail_values(pre_inner)
-    post_details = get_allowed_detail_values(post_inner)
+    # DETAILS: read directly from the tds_root (named-connections & object-graph)
+    pre_details = get_allowed_detail_values_from_tds(pre_tds_root)
+    post_details = get_allowed_detail_values_from_tds(post_tds_root)
 
     matches_by_path, diffs_by_path = {}, {}
     for path in ALLOWED_DETAIL_PATHS:
@@ -560,22 +586,6 @@ def compare_two_datasources(pre_tds_root, post_tds_root):
     is_matched = not (has_col_diff or has_md_diff or has_xml_diff)
 
     return comparison_summary, is_matched
-
-
-# ---------------- Reused helpers ----------------
-def compare_keyed_dicts(pre_dict, post_dict):
-    matches, diffs, only_pre, only_post = [], [], [], []
-    pre_keys, post_keys = set(pre_dict.keys()), set(post_dict.keys())
-    for k in sorted(pre_keys & post_keys):
-        if pre_dict[k] == post_dict[k]:
-            matches.append((k, pre_dict[k], post_dict[k]))
-        else:
-            diffs.append((k, pre_dict[k], post_dict[k]))
-    for k in sorted(pre_keys - post_keys):
-        only_pre.append((k, pre_dict[k]))
-    for k in sorted(post_keys - pre_keys):
-        only_post.append((k, post_dict[k]))
-    return matches, diffs, only_pre, only_post
 
 
 # ---------------- File collection ----------------
@@ -627,7 +637,7 @@ def main():
 
         comps, is_matched = compare_two_datasources(pre_root, post_root)
 
-        # debug counts
+        # Debug counts
         col = comps["columns"]
         md = comps["metadata"]
         xmlc = comps["xml"]
