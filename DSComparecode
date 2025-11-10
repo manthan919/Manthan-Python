@@ -1,12 +1,23 @@
 #!/usr/bin/env python3
 """
-Full end-to-end Tableau datasource comparator.
+Full end-to-end Tableau datasource comparator (updated per user requests).
 
-- Hard-coded directories (edit in main()) for pre/post .tdsx files.
-- Extracts .tds from .tdsx, parses, compares columns, metadata, and allowed XML details.
-- Robust extraction: reads attribute-based and child-element-based formats for <column>.
-- Robust metadata extraction across common .tds layouts.
-- Generates HTML report (same layout you requested) and opens it automatically.
+Changes applied:
+ 1) Skip any column whose resolved DB field name or caption equals "[Migrated Data]" (case-insensitive).
+ 2) In "List of Matched Data sources" the Differences section is removed (only Matches shown).
+ 3) Rename "XML Comparison" to "Details Comparison" in the final HTML and improved extraction
+    of values from inner XML — supports attributes (caption, schema, username, table, name)
+    as well as text nodes.
+ 4) Robust column & metadata extraction (attributes and child tags), handles param prefixing.
+
+Hard-coded directories (edit these to match your environment):
+  - PRE_DIR  : pre-deployment .tdsx folder
+  - POST_DIR : post-deployment .tdsx folder
+
+Output:
+  - datasource_comparison_report.html (created in current working directory)
+
+Run: Save this file and run in your Python environment (PyCharm).
 """
 import os
 import zipfile
@@ -14,13 +25,11 @@ import xml.etree.ElementTree as ET
 import html
 import webbrowser
 
-# ----------------------------
-# Configuration - edit if needed
-# ----------------------------
+# ---------------- Configuration (edit paths to match your environment) ----------------
 PRE_DIR = r"C:\Users\mr05197\PycharmProjects\pythonProject\Full Volume Release\Downloaded Content\ISTD - 31"
 POST_DIR = r"C:\Users\mr05197\PycharmProjects\pythonProject\Full Volume Release\Downloaded Content\STD - FR"
 OUTPUT_HTML = os.path.abspath("datasource_comparison_report.html")
-# ----------------------------
+# ------------------------------------------------------------------------------------
 
 ALLOWED_DETAIL_PATHS = [
     "root/connection/relation/table",
@@ -33,15 +42,14 @@ ALLOWED_DETAIL_PATHS = [
 ]
 
 
-# ----------------------------
-# XML utility helpers
-# ----------------------------
+# ---------------- XML utilities ----------------
 def strip_namespace(elem):
-    """Remove XML namespace prefixes from tags & attributes recursively."""
+    """Strip XML namespaces from tags and attribute names (in-place)."""
     if elem is None:
         return
     if isinstance(elem.tag, str) and elem.tag.startswith("{"):
         elem.tag = elem.tag.split("}", 1)[1]
+    # attributes
     for k in list(elem.attrib.keys()):
         if k.startswith("{"):
             newk = k.split("}", 1)[1]
@@ -51,7 +59,7 @@ def strip_namespace(elem):
 
 
 def extract_tds_from_tdsx(tdsx_path):
-    """Return .tds file contents (first .tds found) from a .tdsx package or None if not found."""
+    """Extract the first .tds file text from a .tdsx (zip)."""
     if not tdsx_path or not os.path.exists(tdsx_path):
         return None
     try:
@@ -62,43 +70,41 @@ def extract_tds_from_tdsx(tdsx_path):
                         data = f.read()
                         return data.decode("utf-8", errors="replace")
     except Exception as e:
-        print(f"ERROR: Unable to open {tdsx_path}: {e}")
+        print(f"ERROR: Could not read {tdsx_path}: {e}")
     return None
 
 
-def parse_tds_from_string(tds_str):
-    """Parse XML string to Element root. Strip namespaces. Return None on failure."""
-    if not tds_str:
+def parse_tds_from_string(tds_string):
+    """Parse TDS XML string to ElementTree root. Strip namespaces."""
+    if not tds_string:
         return None
     try:
-        root = ET.fromstring(tds_str)
+        root = ET.fromstring(tds_string)
         strip_namespace(root)
         return root
     except Exception:
         try:
             parser = ET.XMLParser(encoding="utf-8")
-            root = ET.fromstring(tds_str.encode("utf-8"), parser=parser)
+            root = ET.fromstring(tds_string.encode("utf-8"), parser=parser)
             strip_namespace(root)
             return root
         except Exception as e:
-            print(f"ERROR: Failed parsing TDS XML: {e}")
+            print(f"ERROR: Failed to parse TDS XML: {e}")
             return None
 
 
-# ----------------------------
-# Column extraction (robust)
-# ----------------------------
+# ---------------- Column extraction & skipping Migrated Data ----------------
 def resolve_column_key(col_elem, idx):
     """
-    Resolve DB field identifier for a <column> element.
-    Resolution order:
+    Resolve DB field name for <column> element. Resolution order:
       1) child <name> text
       2) attribute 'name'
       3) child <db-field-name> text
       4) child <caption> text
       5) attribute 'caption'
       6) fallback generated __unnamed_column__N
-    Also detects param-domain-type as child or attribute and prefixes 'Parameter_'.
+
+    If param-domain-type present (child or attribute) prefix 'Parameter_'.
     """
     name = (col_elem.findtext("name") or "").strip()
     if not name:
@@ -118,11 +124,23 @@ def resolve_column_key(col_elem, idx):
     return name
 
 
+def should_skip_column_by_migrated_marker(name_or_caption):
+    """
+    Return True if name_or_caption indicates a migrated-data marker to skip.
+    Case-insensitive compare for '[migrated data]' (brackets included).
+    """
+    if not name_or_caption:
+        return False
+    s = str(name_or_caption).strip()
+    return s.lower() == "[migrated data]" or s.lower() == "migrated data"
+
+
 def get_columns(tds_root):
     """
-    Return dict keyed by DB field name.
-    Value: {'tableau_field_name': caption, 'hidden': 'Yes'/'No', 'is_parameter': bool}
-    Handles attribute-based and child-element formats.
+    Extract columns as dict keyed by DB field name (resolved). Value:
+        {'tableau_field_name': <caption>, 'hidden': 'Yes'|'No', 'is_parameter': bool}
+
+    Skips columns where resolved key or caption equals '[Migrated Data]'.
     """
     columns = {}
     if tds_root is None:
@@ -131,11 +149,16 @@ def get_columns(tds_root):
     for col in tds_root.findall(".//column"):
         idx += 1
         key = resolve_column_key(col, idx)
-        # caption - prefer child text then attribute
+        # caption: prefer child text then attribute
         caption = (col.findtext("caption") or "").strip()
         if not caption:
             caption = (col.get("caption") or "").strip()
-        # hidden - attribute or child
+        # If either resolved key or caption indicates migrated-data, skip this column
+        if should_skip_column_by_migrated_marker(key) or should_skip_column_by_migrated_marker(caption):
+            # Debug print - you can remove or comment out in production
+            # print(f"Skipping migrated-data column: key='{key}', caption='{caption}'")
+            continue
+        # hidden: attribute 'hidden' or child text
         hidden_raw = col.get("hidden")
         if hidden_raw is None:
             hidden_raw = col.findtext("hidden")
@@ -148,27 +171,27 @@ def get_columns(tds_root):
     return columns
 
 
-# ----------------------------
-# Metadata extraction (robust)
-# ----------------------------
+# ---------------- Metadata extraction ----------------
 def get_metadata_records(tds_root):
     """
-    Return dict keyed by remote-name -> {'local_name':..., 'local_type':...}
+    Extract metadata records keyed by remote-name. Return:
+      { remote_name: { 'local_name': ..., 'local_type': ... }, ... }
+
     Supports:
-      - direct <metadata-record> elements with child tags
+      - <metadata-record> child elements with <remote-name>/<local-name>/<local-type>
       - <metadata-records><record> layout
-      - fallback to attributes on elements where used
+      - fallback to attributes on nodes where used
     """
     results = {}
     if tds_root is None:
         return results
 
-    # try direct metadata-record nodes
+    # 1) direct metadata-record elements
     for rec in tds_root.findall(".//metadata-record"):
         remote = (rec.findtext("remote-name") or "").strip()
         local = (rec.findtext("local-name") or "").strip()
         ltype = (rec.findtext("local-type") or "").strip()
-        # fallback to attributes if present
+        # fallback to attributes
         if not remote:
             remote = (rec.get("remote-name") or rec.get("remote") or "").strip()
         if not local:
@@ -178,7 +201,7 @@ def get_metadata_records(tds_root):
         if remote:
             results[remote] = {"local_name": local, "local_type": ltype}
 
-    # fallback: metadata-records/record
+    # 2) fallback layout: metadata-records/record
     for rec in tds_root.findall(".//metadata-records//record"):
         remote = (rec.findtext("remote-name") or "").strip()
         local = (rec.findtext("local-name") or "").strip()
@@ -195,11 +218,12 @@ def get_metadata_records(tds_root):
     return results
 
 
-# ----------------------------
-# XML details parsing (inner xml)
-# ----------------------------
+# ---------------- Inner XML/Details extraction ----------------
 def parse_inner_xml_from_tds(tds_root):
-    """Return parsed inner XML root from <xml> block or reconstructed from <connection> children."""
+    """
+    Parse the inner/external XML inside the <xml> block if present,
+    else try to reconstruct from <connection> children. Return Element root or None.
+    """
     if tds_root is None:
         return None
     xml_elem = tds_root.find(".//xml")
@@ -207,7 +231,6 @@ def parse_inner_xml_from_tds(tds_root):
     if xml_elem is not None and xml_elem.text and xml_elem.text.strip():
         content = xml_elem.text.strip()
     if not content:
-        # reconstruct basic XML from connection children if available
         conn = tds_root.find(".//connection")
         if conn is not None:
             parts = []
@@ -234,28 +257,64 @@ def parse_inner_xml_from_tds(tds_root):
             return None
 
 
+def elem_best_value(elem):
+    """
+    Return the most relevant value for an element:
+      - prefer elem.text if non-empty,
+      - else check common attribute names: 'table', 'name', 'caption', 'schema', 'username'
+      - else return empty string
+    """
+    if elem is None:
+        return ""
+    text = (elem.text or "").strip()
+    if text:
+        return text
+    # check attributes in order
+    for attr in ("table", "name", "caption", "schema", "username", "connection"):
+        v = elem.get(attr)
+        if v:
+            return v.strip()
+    # fallback: join all attributes if present
+    if elem.attrib:
+        # create compact repr "k=v;..."
+        parts = [f"{k}={v}" for k, v in elem.attrib.items()]
+        return ";".join(parts)
+    return ""
+
+
 def get_allowed_detail_values(inner_root):
-    """Extract text values for each allowed detail path; returns dict path->list(values)."""
+    """
+    For each ALLOWED_DETAIL_PATHS entry, return list of values found (document order).
+    Values are extracted via elem_best_value() so attributes are considered.
+    Returns dict: path -> [val, ...]
+    """
     results = {p: [] for p in ALLOWED_DETAIL_PATHS}
     if inner_root is None:
         return results
     for path in ALLOWED_DETAIL_PATHS:
         parts = path.split("/")
+        # Build an xpath relative search for the non-root portion
         xpath = ".//" + "/".join(parts[1:]) if parts[0] == inner_root.tag else ".//" + "/".join(parts)
         try:
             found = inner_root.findall(xpath)
         except Exception:
+            # fallback to find by last tag name
             found = inner_root.findall(".//" + parts[-1])
         for elem in found:
-            text = elem.text.strip() if elem.text and elem.text.strip() else ""
-            results[path].append(text)
+            val = elem_best_value(elem)
+            results[path].append(val)
     return results
 
 
-# ----------------------------
-# comparison helpers
-# ----------------------------
+# ---------------- Comparison helpers ----------------
 def compare_keyed_dicts(pre_dict, post_dict):
+    """
+    Compare two keyed dicts. Returns (matches, diffs, only_pre, only_post)
+    matches: [(key, pre_val, post_val), ...] where pre_val == post_val
+    diffs: [(key, pre_val, post_val), ...] where differ
+    only_pre: [(key, pre_val), ...]
+    only_post: [(key, post_val), ...]
+    """
     matches, diffs, only_pre, only_post = [], [], [], []
     pre_keys, post_keys = set(pre_dict.keys()), set(post_dict.keys())
     for k in sorted(pre_keys & post_keys):
@@ -271,6 +330,11 @@ def compare_keyed_dicts(pre_dict, post_dict):
 
 
 def compare_lists_by_index(pre_list, post_list):
+    """
+    Compare two lists by index. Return (matches, diffs)
+    matches: [(index, value), ...] where equal and not None
+    diffs: [(index, pre_val, post_val), ...]
+    """
     matches, diffs = [], []
     maxlen = max(len(pre_list), len(post_list))
     for i in range(maxlen):
@@ -283,9 +347,7 @@ def compare_lists_by_index(pre_list, post_list):
     return matches, diffs
 
 
-# ----------------------------
-# HTML builders (kept layout unchanged)
-# ----------------------------
+# ---------------- HTML builders (layout preserved, with renames/changes) ----------------
 def build_column_tables_html(matches, diffs, only_pre, only_post, pre_label="Pre-Deployment", post_label="Post Deployment"):
     header = """
 <table class="compare" border="1" cellspacing="0" cellpadding="4">
@@ -370,7 +432,11 @@ def build_metadata_tables_html(matches, diffs, only_pre, only_post, pre_label="P
     return matches_html, diffs_html
 
 
-def build_xml_tables_html(matches_by_path, diffs_by_path):
+def build_details_tables_html(matches_by_path, diffs_by_path):
+    """
+    Build Details Comparison tables (renamed from XML Comparison).
+    Renders a single 3-column table per Matches/Differences with Attribute | Pre Deployment | Post Deployment.
+    """
     def build_table(rows, headers=("Attribute", "Pre Deployment", "Post Deployment")):
         h = '<table border="1" cellpadding="6" cellspacing="0">'
         h += '<thead><tr>' + ''.join(f'<th>{html.escape(col)}</th>' for col in headers) + '</tr></thead><tbody>'
@@ -379,17 +445,21 @@ def build_xml_tables_html(matches_by_path, diffs_by_path):
         else:
             for attr, pre, post in rows:
                 h += f'<tr><td>{html.escape(attr)}</td><td>{html.escape(pre or "Not Present")}</td><td>{html.escape(post or "Not Present")}</td></tr>'
-        h += "</tbody></table>"
+        h += '</tbody></table>'
         return h
 
     matches_rows = []
     diffs_rows = []
     for path in ALLOWED_DETAIL_PATHS:
-        for idx, val in matches_by_path.get(path, []):
-            attr = path if len(matches_by_path.get(path, [])) <= 1 else f"{path}[{idx}]"
+        matches = matches_by_path.get(path, [])
+        diffs = diffs_by_path.get(path, [])
+        # Matches
+        for idx, val in matches:
+            attr = path if len(matches) <= 1 else f"{path}[{idx}]"
             matches_rows.append((attr, val, val))
-        for idx, pre, post in diffs_by_path.get(path, []):
-            attr = path if len(diffs_by_path.get(path, [])) <= 1 else f"{path}[{idx}]"
+        # Diffs
+        for idx, pre, post in diffs:
+            attr = path if len(diffs) <= 1 else f"{path}[{idx}]"
             diffs_rows.append((attr, pre or "Not Present", post or "Not Present"))
 
     matches_html = build_table(matches_rows)
@@ -397,9 +467,7 @@ def build_xml_tables_html(matches_by_path, diffs_by_path):
     return matches_html, diffs_html
 
 
-# ----------------------------
-# Report generation
-# ----------------------------
+# ---------------- Report generation ----------------
 def generate_html_report(results, output_path):
     total = results.get("total", 0)
     entries = results.get("entries", [])
@@ -409,120 +477,109 @@ def generate_html_report(results, output_path):
     html_parts = []
     html_parts.append('<!doctype html><html><head><meta charset="utf-8"><title>Data source comparison report</title>')
     html_parts.append('<style> body{font-family:Arial,Helvetica,sans-serif;padding:20px} table.compare{border-collapse:collapse;width:100%;margin-bottom:10px} table.compare th{background:#eee} details{margin-bottom:6px;padding:4px} table{width:100%;border-collapse:collapse} th{background:#e6f2ff} td, th{border:1px solid #999;padding:6px}</style>')
-    html_parts.append("</head><body>")
-    html_parts.append("<h1>Data source comparison report</h1>")
-    html_parts.append(f"<p>Total number of Data sources compared: <strong>{total}</strong><br>")
-    html_parts.append(f"Total number of matched Data sources: <strong>{len(matched)}</strong><br>")
-    html_parts.append(f"Total number of unmatched Data sources: <strong>{len(unmatched)}</strong></p>")
+    html_parts.append('</head><body>')
+    html_parts.append('<h1>Data source comparison report</h1>')
+    html_parts.append(f'<p>Total number of Data sources compared: <strong>{total}</strong><br>')
+    html_parts.append(f'Total number of matched Data sources: <strong>{len(matched)}</strong><br>')
+    html_parts.append(f'Total number of unmatched Data sources: <strong>{len(unmatched)}</strong></p>')
 
-    # Unmatched
-    html_parts.append("<h2>List of Unmatched Data sources</h2>")
+    # Unmatched Data sources (full drilldowns)
+    html_parts.append('<h2>List of Unmatched Data sources</h2>')
     if unmatched:
-        html_parts.append("<ol>")
+        html_parts.append('<ol>')
         for entry in unmatched:
             name = entry["name"]
             comps = entry["comparisons"]
             html_parts.append(f'<li><details><summary>{html.escape(name)}</summary>')
-            # Columns
+            # Column Comparison
             col = comps["columns"]
             col_matches_html, col_diffs_html = build_column_tables_html(col["matches"], col["diffs"], col["only_pre"], col["only_post"])
-            html_parts.append("<h4>Column Comparison</h4>")
-            html_parts.append("<details><summary>Matches</summary>")
+            html_parts.append('<h4>Column Comparison</h4>')
+            html_parts.append('<details><summary>Matches</summary>')
             html_parts.append(col_matches_html)
-            html_parts.append("</details>")
-            html_parts.append("<details><summary>Differences</summary>")
+            html_parts.append('</details>')
+            html_parts.append('<details><summary>Differences</summary>')
             html_parts.append(col_diffs_html)
-            html_parts.append("</details>")
-            # Metadata
+            html_parts.append('</details>')
+            # Metadata Comparison
             md = comps["metadata"]
             md_matches_html, md_diffs_html = build_metadata_tables_html(md["matches"], md["diffs"], md["only_pre"], md["only_post"])
-            html_parts.append("<h4>Metadata Comparison</h4>")
-            html_parts.append("<details><summary>Matches</summary>")
+            html_parts.append('<h4>Metadata Comparison</h4>')
+            html_parts.append('<details><summary>Matches</summary>')
             html_parts.append(md_matches_html)
-            html_parts.append("</details>")
-            html_parts.append("<details><summary>Differences</summary>")
+            html_parts.append('</details>')
+            html_parts.append('<details><summary>Differences</summary>')
             html_parts.append(md_diffs_html)
-            html_parts.append("</details>")
-            # XML
+            html_parts.append('</details>')
+            # Details Comparison (renamed from XML)
             xmlc = comps["xml"]
-            xml_matches_html, xml_diffs_html = build_xml_tables_html(xmlc["matches_by_path"], xmlc["diffs_by_path"])
-            html_parts.append("<h4>XML Comparison</h4>")
-            html_parts.append("<details><summary>Matches</summary>")
-            html_parts.append(xml_matches_html)
-            html_parts.append("</details>")
-            html_parts.append("<details><summary>Differences</summary>")
-            html_parts.append(xml_diffs_html)
-            html_parts.append("</details>")
-            html_parts.append("</details></li>")
-        html_parts.append("</ol>")
+            details_matches_html, details_diffs_html = build_details_tables_html(xmlc["matches_by_path"], xmlc["diffs_by_path"])
+            html_parts.append('<h4>Details Comparison</h4>')
+            html_parts.append('<details><summary>Matches</summary>')
+            html_parts.append(details_matches_html)
+            html_parts.append('</details>')
+            html_parts.append('<details><summary>Differences</summary>')
+            html_parts.append(details_diffs_html)
+            html_parts.append('</details>')
+            html_parts.append('</details></li>')
+        html_parts.append('</ol>')
     else:
-        html_parts.append("<p><em>No unmatched data sources.</em></p>")
+        html_parts.append('<p><em>No unmatched data sources.</em></p>')
 
-    # Matched
-    html_parts.append("<h2>List of Matched Data sources</h2>")
+    # Matched Data sources (only show Matches; Differences removed)
+    html_parts.append('<h2>List of Matched Data sources</h2>')
     if matched:
-        html_parts.append("<ol>")
+        html_parts.append('<ol>')
         for entry in matched:
             name = entry["name"]
             comps = entry["comparisons"]
             html_parts.append(f'<li><details open><summary>{html.escape(name)}</summary>')
-            # Columns
+            # Columns - only Matches
             col = comps["columns"]
-            col_matches_html, col_diffs_html = build_column_tables_html(col["matches"], col["diffs"], col["only_pre"], col["only_post"])
-            html_parts.append("<h4>Column Comparison</h4>")
-            html_parts.append("<details open><summary>Matches</summary>")
+            col_matches_html, _ = build_column_tables_html(col["matches"], col["diffs"], col["only_pre"], col["only_post"])
+            html_parts.append('<h4>Column Comparison</h4>')
+            html_parts.append('<details open><summary>Matches</summary>')
             html_parts.append(col_matches_html)
-            html_parts.append("</details>")
-            html_parts.append("<details><summary>Differences</summary>")
-            html_parts.append(col_diffs_html)
-            html_parts.append("</details>")
-            # Metadata
+            html_parts.append('</details>')
+            # Metadata - only Matches
             md = comps["metadata"]
-            md_matches_html, md_diffs_html = build_metadata_tables_html(md["matches"], md["diffs"], md["only_pre"], md["only_post"])
-            html_parts.append("<h4>Metadata Comparison</h4>")
-            html_parts.append("<details open><summary>Matches</summary>")
+            md_matches_html, _ = build_metadata_tables_html(md["matches"], md["diffs"], md["only_pre"], md["only_post"])
+            html_parts.append('<h4>Metadata Comparison</h4>')
+            html_parts.append('<details open><summary>Matches</summary>')
             html_parts.append(md_matches_html)
-            html_parts.append("</details>")
-            html_parts.append("<details><summary>Differences</summary>")
-            html_parts.append(md_diffs_html)
-            html_parts.append("</details>")
-            # XML
+            html_parts.append('</details>')
+            # Details - only Matches
             xmlc = comps["xml"]
-            xml_matches_html, xml_diffs_html = build_xml_tables_html(xmlc["matches_by_path"], xmlc["diffs_by_path"])
-            html_parts.append("<h4>XML Comparison</h4>")
-            html_parts.append("<details open><summary>Matches</summary>")
-            html_parts.append(xml_matches_html)
-            html_parts.append("</details>")
-            html_parts.append("<details><summary>Differences</summary>")
-            html_parts.append(xml_diffs_html)
-            html_parts.append("</details>")
-            html_parts.append("</details></li>")
-        html_parts.append("</ol>")
+            details_matches_html, _ = build_details_tables_html(xmlc["matches_by_path"], xmlc["diffs_by_path"])
+            html_parts.append('<h4>Details Comparison</h4>')
+            html_parts.append('<details open><summary>Matches</summary>')
+            html_parts.append(details_matches_html)
+            html_parts.append('</details>')
+            html_parts.append('</details></li>')
+        html_parts.append('</ol>')
     else:
-        html_parts.append("<p><em>No matched data sources.</em></p>")
+        html_parts.append('<p><em>No matched data sources.</em></p>')
 
-    html_parts.append("</body></html>")
+    html_parts.append('</body></html>')
 
     with open(output_path, "w", encoding="utf-8") as f:
         f.write("\n".join(html_parts))
-    print(f"INFO: Wrote report to {output_path}")
+    print(f"INFO: Wrote report: {output_path}")
 
 
-# ----------------------------
-# High-level comparison flow
-# ----------------------------
+# ---------------- Core comparison flow ----------------
 def compare_two_datasources(pre_tds_root, post_tds_root):
-    # columns
+    # Columns
     pre_cols = get_columns(pre_tds_root)
     post_cols = get_columns(post_tds_root)
     col_matches, col_diffs, col_only_pre, col_only_post = compare_keyed_dicts(pre_cols, post_cols)
 
-    # metadata
+    # Metadata
     pre_md = get_metadata_records(pre_tds_root)
     post_md = get_metadata_records(post_tds_root)
     md_matches, md_diffs, md_only_pre, md_only_post = compare_keyed_dicts(pre_md, post_md)
 
-    # xml details
+    # Details (inner xml)
     pre_inner = parse_inner_xml_from_tds(pre_tds_root)
     post_inner = parse_inner_xml_from_tds(post_tds_root)
     pre_details = get_allowed_detail_values(pre_inner)
@@ -549,10 +606,8 @@ def compare_two_datasources(pre_tds_root, post_tds_root):
     return comparison_summary, is_matched
 
 
-# ----------------------------
-# helpers reused
-# ----------------------------
 def compare_keyed_dicts(pre_dict, post_dict):
+    """Utility used elsewhere (kept local duplicate for clarity)."""
     matches, diffs, only_pre, only_post = [], [], [], []
     pre_keys, post_keys = set(pre_dict.keys()), set(post_dict.keys())
     for k in sorted(pre_keys & post_keys):
@@ -567,11 +622,9 @@ def compare_keyed_dicts(pre_dict, post_dict):
     return matches, diffs, only_pre, only_post
 
 
-# ----------------------------
-# File collection
-# ----------------------------
+# ---------------- File collection helpers ----------------
 def collect_tdsx_files(directory):
-    """Return dict basename->fullpath for .tdsx files in directory."""
+    """Collect .tdsx files in a directory and return dict basename->fullpath."""
     files = {}
     if not directory or not os.path.isdir(directory):
         return files
@@ -582,13 +635,14 @@ def collect_tdsx_files(directory):
     return files
 
 
-# ----------------------------
-# Main
-# ----------------------------
+# ---------------- Main ----------------
 def main():
     pre_files = collect_tdsx_files(PRE_DIR)
     post_files = collect_tdsx_files(POST_DIR)
-    print(f"DEBUG: Pre files={len(pre_files)} Post files={len(post_files)}")
+    print(f"DEBUG: Pre files = {len(pre_files)}, Post files = {len(post_files)}")
+    if not pre_files and not post_files:
+        print("WARNING: No .tdsx files found in either folder. Check PRE_DIR/POST_DIR configuration.")
+
     all_keys = sorted(set(pre_files.keys()) | set(post_files.keys()))
     total = len(all_keys)
     entries = []
@@ -596,7 +650,7 @@ def main():
     for key in all_keys:
         pre_path = pre_files.get(key)
         post_path = post_files.get(key)
-        print(f"DEBUG: Processing '{key}': pre={bool(pre_path)} post={bool(post_path)}")
+        print(f"DEBUG: Processing '{key}' -- pre: {bool(pre_path)} post: {bool(post_path)}")
 
         pre_root = None
         post_root = None
@@ -604,32 +658,44 @@ def main():
         if pre_path:
             tds_str = extract_tds_from_tdsx(pre_path)
             if tds_str is None:
-                print(f"DEBUG: Could not extract .tds from pre: {pre_path}")
+                print(f"DEBUG: Failed to extract pre .tds for {key} from {pre_path}")
             pre_root = parse_tds_from_string(tds_str) if tds_str else None
 
         if post_path:
             tds_str = extract_tds_from_tdsx(post_path)
             if tds_str is None:
-                print(f"DEBUG: Could not extract .tds from post: {post_path}")
+                print(f"DEBUG: Failed to extract post .tds for {key} from {post_path}")
             post_root = parse_tds_from_string(tds_str) if tds_str else None
 
-        # Compare (works even if one side is None)
         comps, is_matched = compare_two_datasources(pre_root, post_root)
+
+        # Debug counts
+        col = comps["columns"]
+        md = comps["metadata"]
+        xmlc = comps["xml"]
+        col_match_count = len(col.get("matches") or [])
+        col_diff_count = len(col.get("diffs") or []) + len(col.get("only_pre") or []) + len(col.get("only_post") or [])
+        md_match_count = len(md.get("matches") or [])
+        md_diff_count = len(md.get("diffs") or []) + len(md.get("only_pre") or []) + len(md.get("only_post") or [])
+        xml_diff_count = sum(len(xmlc["diffs_by_path"].get(p, [])) for p in xmlc["diffs_by_path"])
+        xml_match_count = sum(len(xmlc["matches_by_path"].get(p, [])) for p in xmlc["matches_by_path"])
+        print(f"DEBUG: '{key}': cols matched={col_match_count}, cols diffs={col_diff_count}; md matched={md_match_count}, md diffs={md_diff_count}; xml matched={xml_match_count}, xml diffs={xml_diff_count}; is_matched={is_matched}")
+
         entries.append({"name": key, "comparisons": comps, "is_matched": is_matched})
 
     matched_count = sum(1 for e in entries if e["is_matched"])
     unmatched_count = sum(1 for e in entries if not e["is_matched"])
-    print(f"DEBUG: Total={total} Matched={matched_count} Unmatched={unmatched_count}")
+    print(f"DEBUG: Total={total}, Matched={matched_count}, Unmatched={unmatched_count}")
 
     results = {"total": total, "entries": entries}
     generate_html_report(results, OUTPUT_HTML)
 
-    # open HTML automatically
+    # Auto-open report
     if os.path.exists(OUTPUT_HTML):
         webbrowser.open(f"file://{OUTPUT_HTML}")
-        print(f"INFO: Opened report {OUTPUT_HTML}")
+        print(f"INFO: Opened report: {OUTPUT_HTML}")
     else:
-        print("ERROR: Report not found after generation.")
+        print("ERROR: Report file not found after generation.")
 
 
 if __name__ == "__main__":
