@@ -1,0 +1,61 @@
+import os
+import pandas as pd
+from tableauserverclient import TableauAuth, Server
+
+def get_config():
+    """Store Tableau Server login details here."""
+    return {
+        "server_url": "https://your-tableau-server",
+        "site_name": "your-site-name",  # "" if default site
+        "username": "your-username",
+        "password": "your-password"
+    }
+
+
+def download_tableau_content_from_links(excel_path, download_folder="downloads"):
+    
+    # Create folder if not exists
+    if not os.path.exists(download_folder):
+        os.makedirs(download_folder)
+
+    # Read Excel and extract LINK column
+    df = pd.read_excel(excel_path)
+    if "LINK" not in df.columns:
+        raise Exception("LINK column not found in Excel file")
+    links = df["LINK"].dropna().tolist()
+
+    cfg = get_config()
+    tableau_auth = TableauAuth(cfg["username"], cfg["password"], site=cfg["site_name"])
+    server = Server(cfg["server_url"], use_server_version=True)
+
+    with server.auth.signin(tableau_auth):
+
+        for link in links:
+            print(f"Processing: {link}")
+
+            # Extract ID from URL
+            content_id = link.split("/")[-1]
+
+            if "/workbooks/" in link.lower():
+                try:
+                    wb_item = server.workbooks.get_by_id(content_id)
+                    file_path = server.workbooks.download(wb_item.id, filepath=download_folder)
+                    print(f"Downloaded Workbook: {file_path}")
+                except Exception as e:
+                    print(f"Workbook download failed: {e}")
+
+            elif "/flows/" in link.lower():
+                try:
+                    flow_item = server.flows.get_by_id(content_id)
+                    file_path = server.flows.download(flow_item.id, filepath=download_folder)
+                    print(f"Downloaded Flow: {file_path}")
+                except Exception as e:
+                    print(f"Flow download failed: {e}")
+
+            else:
+                print("Unknown content type. Skipping...")
+
+
+if __name__ == "__main__":
+    excel_file_path = "input.xlsx"  # Replace with your Excel file
+    download_tableau_content_from_links(excel_file_path)
