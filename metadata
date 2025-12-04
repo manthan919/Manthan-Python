@@ -1,0 +1,57 @@
+WITH RECURSIVE project_paths AS (
+  -- 1. Base Case: Select top-level projects (Root)
+  SELECT 
+    id, 
+    name, 
+    parent_project_id, 
+    CAST(name AS TEXT) as full_path
+  FROM projects
+  WHERE parent_project_id IS NULL
+
+  UNION ALL
+
+  -- 2. Recursive Step: Join children to parents and build the path string
+  SELECT 
+    child.id, 
+    child.name, 
+    child.parent_project_id, 
+    CAST(parent.full_path || '/' || child.name AS TEXT)
+  FROM projects child
+  JOIN project_paths parent ON child.parent_project_id = parent.id
+)
+
+-- 3. Main Selection: Join Workbooks and Datasources to the Paths
+SELECT 
+  -- 1. Data Source Name (Uses Published name if available, else Connection name)
+  COALESCE(ds.name, dc.name) AS "Data Source Name",
+  
+  -- 2. Data Source Path (Only populates for Published Data Sources)
+  ds_path.full_path AS "Data Source Path",
+  
+  -- 3. Data Source DB Name (The database identifier/schema)
+  dc.dbname AS "Data Source DB Name",
+  
+  -- 4. Workbook Name
+  w.name AS "Workbook Name",
+  
+  -- 5. Workbook Path
+  wb_path.full_path AS "Workbook Path"
+
+FROM workbooks w
+
+-- Join to get the Workbook's Project Path
+JOIN project_paths wb_path 
+  ON w.project_id = wb_path.id
+
+-- Join to get the Data Connections owned by the Workbook
+JOIN data_connections dc 
+  ON w.id = dc.owner_id 
+  AND dc.owner_type = 'Workbook'
+
+-- Left Join to 'datasources' to check if this is a Published Data Source
+LEFT JOIN datasources ds 
+  ON dc.datasource_id = ds.id
+
+-- Left Join to get the Published Data Source's Project Path
+LEFT JOIN project_paths ds_path 
+  ON ds.project_id = ds_path.id;
